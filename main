@@ -1,0 +1,393 @@
+use std::io::{self, Write};
+use std::collections::VecDeque;
+
+// Add `crossterm = "0.27"` to Cargo.toml for terminal control
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::terminal::{enable_raw_mode, disable_raw_mode};
+use crossterm::cursor::{MoveTo, Hide, Show};
+use crossterm::style::{Print, ResetColor, SetForegroundColor, Color};
+use crossterm::execute;
+
+// --- 1. DATA STRUCTURES ---
+
+/// Represents the text content of a buffer
+struct Buffer {
+    lines: Vec<String>,
+}
+
+impl Buffer {
+    fn new() -> Self {
+        Buffer {
+            lines: vec!["".to_string()], // Start with one empty line
+        }
+    }
+
+    fn insert_char(&mut self, ch: char, row: usize, col: usize) {
+        if row >= self.lines.len() {
+            self.lines.resize(row + 1, "".to_string());
+        }
+        let line = &mut self.lines[row];
+        if col > line.len() {
+            line.push_str(&" ".repeat(col - line.len()));
+        }
+        line.insert(col, ch);
+    }
+
+    fn delete_char(&mut self, row: usize, col: usize) {
+        if row < self.lines.len() && col < self.lines[row].len() {
+            self.lines[row].remove(col);
+        }
+    }
+
+    fn newline(&mut self, row: usize, col: usize) {
+        // Ensure the line exists — just in case
+        if row >= self.lines.len() {
+            self.lines.resize(row + 1, "".to_string());
+        }
+
+        let current_line = self.lines.remove(row);
+        let left = current_line[..col.min(current_line.len())].to_string();
+        let right = current_line[col.min(current_line.len())..].to_string();
+
+        self.lines.insert(row, left);
+        self.lines.insert(row + 1, right);
+    }
+
+    fn get_line(&self, row: usize) -> &str {
+        if row < self.lines.len() {
+            &self.lines[row]
+        } else {
+            ""
+        }
+    }
+
+    fn height(&self) -> usize {
+        self.lines.len()
+    }
+
+    fn join_line_with_next(&mut self, row: usize) {
+        if row + 1 < self.lines.len() {
+            let next = self.lines.remove(row + 1);
+            self.lines[row].push_str(&next);
+        }
+    }
+}
+
+/// The Kill Ring (Yank Ring) - A FIFO queue for cut text
+struct KillRing {
+    history: VecDeque<String>,
+    max_size: usize,
+}
+
+impl KillRing {
+    fn new() -> Self {
+        KillRing {
+            history: VecDeque::new(),
+            max_size: 60, // GNU Emacs default
+        }
+    }
+
+    fn kill(&mut self, text: String) {
+        if self.history.len() >= self.max_size {
+            self.history.pop_back();
+        }
+        self.history.push_front(text);
+    }
+
+    fn yank(&self) -> Option<&String> {
+        self.history.front()
+    }
+}
+
+/// The State of the Editor
+struct Editor {
+    buffer: Buffer,
+    cursor_row: usize,
+    cursor_col: usize,
+    kill_ring: KillRing,
+    quit: bool,
+}
+
+impl Editor {
+    fn new() -> Self {
+        Editor {
+            buffer: Buffer::new(),
+            cursor_row: 0,
+            cursor_col = 0,
+            kill_ring: KillRing::new(),
+            quit: false,
+        }
+    }
+
+    // --- Core Movement Functions ---
+
+    fn move_up(&mut self) {
+        if self.cursor_row > 0 {
+            self.cursor_row -= 1;
+            let max_col = self.buffer.get_line(self.cursor_row).len();
+            if self.cursor_col > max_col {
+                self.cursor_col = max_col;
+            }
+        }
+    }
+
+    fn move_down(&mut self) {
+        if self.cursor_row + 1 < self.buffer.height() {
+            self.cursor_row += 1;
+            let max_col = self.buffer.get_line(self.cursor_row).len();
+            if self.cursor_col > max_col {
+                self.cursor_col = max_col;
+            }
+        }
+    }
+
+    fn move_left(&mut self) {
+        if self.cursor_col > 0 {
+            self.cursor_col -= 1;
+        } else if self.cursor_row > 0 {
+            self.cursor_row -= 1;
+            self.cursor_col = self.buffer.get_line(self.cursor_row).len();
+        }
+    }
+
+    fn move_right(&mut self) {
+        let line_len = self.buffer.get_line(self.cursor_row).len();
+        if self.cursor_col < line_len {
+            self.cursor_col += 1;
+        } else if self.cursor_row + 1 < self.buffer.height() {
+            self.cursor_row += 1;
+            self.cursor_col = 0;
+        }
+    }
+
+    // --- Core Editing Functions ---
+
+    fn insert_char(&mut self, ch: char) {
+        self.buffer.insert_char(ch, self.cursor_row, self.cursor_col);
+        self.move_right();
+    }
+
+    fn delete_char(&mut self) {
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+
+        if col < self.buffer.get_line(row).len() {
+            // Delete char under cursor
+            self.buffer.delete_char(row, col);
+        } else if row + 1 < self.buffer.height() {
+            // Join lines (like C-d in Emacs)
+            self.buffer.join_line_with_next(row);
+        }
+    }
+
+    fn kill_word(&mut self) {
+        let line = self.buffer.get_line(self.cursor_row).to_string();
+        let killed = line[self.cursor_col..].to_string();
+
+        if !killed.is_empty() {
+            self.kill_ring.kill(killed);
+        }
+
+        let new_line = line[..self.cursor_col.min(line.len())].to_string();
+        self.buffer.lines[self.cursor_row] = new_line;
+    }
+
+    fn newline(&mut self) {
+        self.buffer.newline(self.cursor_row, self.cursor_col);
+        self.move_down();
+        self.cursor_col = 0;
+    }
+
+    fn yank(&mut self) {
+        if let Some(text) = self.kill_ring.yank() {
+            for ch in text.chars() {
+                self.insert_char(ch);
+            }
+        }
+    }
+
+    // --- UI & Rendering ---
+
+    fn render(&self) -> io::Result<()> {
+        let stdout = io::stdout();
+        execute!(stdout, Hide)?;
+
+        // Clear screen & move home
+        execute!(stdout, crossterm::terminal::Clear(crossterm::terminal::ClearType::All))?;
+        execute!(stdout, MoveTo(0, 0))?;
+
+        // Render each line
+        for (i, line) in self.buffer.lines.iter().enumerate() {
+            if i == self.cursor_row {
+                // Render with cursor highlight
+                let max_col = line.len();
+                let (before, current, after) = if self.cursor_col < max_col {
+                    let before = &line[..self.cursor_col];
+                    let current = line[self.cursor_col..=self.cursor_col].to_string();
+                    let after = &line[self.cursor_col + 1..];
+                    (before, current, after)
+                } else {
+                    let before = line;
+                    let current = " ".to_string();
+                    ("", current, "")
+                };
+                write!(stdout, "{}", before)?;
+                execute!(
+                    stdout,
+                    SetForegroundColor(Color::Black),
+                    Print(current),
+                    SetForegroundColor(Color::White),
+                )?;
+                write!(stdout, "{}", after)?;
+            } else {
+                writeln!(stdout, "{}", line)?;
+            }
+        }
+
+        // Status line
+        let pos = format!("Row: {}, Col: {}", self.cursor_row, self.cursor_col);
+        let dashes_before = 10;
+        let dashes_after = 20 - pos.len() - dashes_before;
+        let status_line = format!(
+            "{}{}{}{}{}",
+            "-".repeat(dashes_before),
+            pos,
+            "-".repeat(dashes_after),
+            " - RustEmacs",
+            "-".repeat(10)
+        );
+        execute!(
+            stdout,
+            MoveTo(0, self.buffer.height() as u16 + 1),
+            SetForegroundColor(Color::Black),
+            Print(status_line),
+            ResetColor,
+        )?;
+
+        // Instructions
+        writeln!(
+            stdout,
+            "\n(C-x C-c to quit) | (C-f/b/n/p) | (C-d) | (M-w Kill Word) | (C-y Yank)"
+        )?;
+
+        execute!(stdout, Show)?;
+        stdout.flush()
+    }
+
+    fn run(&mut self) -> io::Result<()> {
+        // Enter raw mode
+        enable_raw_mode()?;
+
+        // Setup signal handling (optional but good for restore)
+        let _restore = OnDrop::new(|| {
+            let _ = disable_raw_mode();
+        });
+
+        println!("RustEmacs - A Minimal Emacs Clone in Rust");
+        println!("Controls:");
+        println!("  Ctrl-f: Forward char");
+        println!("  Ctrl-b: Backward char");
+        println!("  Ctrl-n: Next line");
+        println!("  Ctrl-p: Previous line");
+        println!("  Ctrl-d: Delete char");
+        println!("  Ctrl-a: Move to start of line");
+        println!("  Ctrl-e: Move to end of line");
+        println!("  Meta-w (Alt-w): Copy line");
+        println!("  Ctrl-w: Cut (Kill) to end of line");
+        println!("  Ctrl-y: Yank (Paste)");
+        println!("  Ctrl-x Ctrl-c: Quit");
+
+        self.render()?;
+
+        loop {
+            match event::read()? {
+                Event::Key(key_event) => {
+                    match key_event.code {
+                        KeyCode::Char(c) => {
+                            if key_event.modifiers.contains(KeyModifiers::CONTROL) {
+                                match c {
+                                    'f' => self.move_right(),
+                                    'b' => self.move_left(),
+                                    'n' => self.move_down(),
+                                    'p' => self.move_up(),
+                                    'd' => self.delete_char(),
+                                    'a' => self.cursor_col = 0,
+                                    'e' => self.cursor_col = self.buffer.get_line(self.cursor_row).len(),
+                                    'x' => {
+                                        // Expect second key (C-x)
+                                        if let Event::Key(k) = event::read()? {
+                                            if k.code == KeyCode::Char('c')
+                                                && k.modifiers.contains(KeyModifiers::CONTROL)
+                                            {
+                                                self.quit = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    'w' => self.kill_word(),
+                                    _ => {}
+                                }
+                            } else if key_event.modifiers.contains(KeyModifiers::ALT) {
+                                if c == 'w' {
+                                    let line = self.buffer.get_line(self.cursor_row).to_string();
+                                    self.kill_ring.kill(line);
+                                } else if c == 'y' {
+                                    self.yank();
+                                }
+                            } else {
+                                self.insert_char(c);
+                            }
+                        }
+                        KeyCode::Left => self.move_left(),
+                        KeyCode::Right => self.move_right(),
+                        KeyCode::Up => self.move_up(),
+                        KeyCode::Down => self.move_down(),
+                        KeyCode::Backspace => {
+                            self.move_left();
+                            self.delete_char();
+                        }
+                        KeyCode::Enter => {
+                            self.newline();
+                        }
+                        _ => {}
+                    }
+                    self.render()?;
+                }
+                Event::Resize(_, _) => {
+                    // Ignore resize for now
+                }
+                _ => {}
+            }
+
+            if self.quit {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// Helper to restore state on drop
+struct OnDrop<F: FnMut()> {
+    f: F,
+}
+
+impl<F: FnMut()> OnDrop<F> {
+    fn new(f: F) -> Self {
+        Self { f }
+    }
+}
+
+impl<F: FnMut()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        (self.f)();
+    }
+}
+
+// --- MAIN ENTRY POINT ---
+
+fn main() -> io::Result<()> {
+    let mut editor = Editor::new();
+    editor.run()
+}
