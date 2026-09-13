@@ -1,7 +1,6 @@
 use std::io::{self, Write};
 use std::collections::VecDeque;
 
-// Add `crossterm = "0.27"` to Cargo.toml for terminal control
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{enable_raw_mode, disable_raw_mode};
 use crossterm::cursor::{MoveTo, Hide, Show};
@@ -11,6 +10,7 @@ use crossterm::execute;
 // --- 1. DATA STRUCTURES ---
 
 /// Represents the text content of a buffer
+#[derive(Clone, Debug)]
 struct Buffer {
     lines: Vec<String>,
 }
@@ -40,7 +40,6 @@ impl Buffer {
     }
 
     fn newline(&mut self, row: usize, col: usize) {
-        // Ensure the line exists — just in case
         if row >= self.lines.len() {
             self.lines.resize(row + 1, "".to_string());
         }
@@ -71,31 +70,235 @@ impl Buffer {
             self.lines[row].push_str(&next);
         }
     }
+
+    /// Returns `(row, col)` of first occurrence of `query`, or `None`
+    fn search_forward(&self, start_row: usize, start_col: usize, query: &str) -> Option<(usize, usize)> {
+        if query.is_empty() {
+            return Some((start_row, start_col));
+        }
+
+        // Start from given position
+        let mut row = start_row;
+        let mut col = start_col;
+        let mut search_line = row;
+        let mut search_col = col;
+
+        loop {
+            if search_line >= self.lines.len() {
+                break;
+            }
+            let line = &self.lines[search_line];
+            if search_line == row {
+                // slice from current position
+                if let Some(idx) = line[search_col..].find(query) {
+                    return Some((search_line, search_col + idx));
+                }
+            } else {
+                if let Some(idx) = line.find(query) {
+                    return Some((search_line, idx));
+                }
+            }
+
+            // Next line
+            search_line += 1;
+            search_col = 0;
+        }
+
+        // Wrap around? We won’t wrap for simplicity — just return None
+        None
+    }
+
+    fn search_backward(&self, start_row: usize, start_col: usize, query: &str) -> Option<(usize, usize)> {
+        if query.is_empty() {
+            return Some((start_row, start_col));
+        }
+
+        let mut row = start_row;
+        let mut col = start_col;
+
+        // Start from start_row and go backward
+        for r in (0..=row).rev() {
+            let line = &self.lines[r];
+            let start_search_col = if r == row { col } else { line.len() };
+
+            // Look for last occurrence in this line
+            let mut last_pos = None;
+            let mut pos = 0;
+            while pos <= start_search_col - query.len() {
+                if line[pos..].starts_with(query) {
+                    last_pos = Some(pos);
+                }
+                pos += 1;
+            }
+            if let Some(idx) = last_pos {
+                return Some((r, idx));
+            }
+        }
+
+        None
+    }
+}
+
+// Undo history — stores line-by-line diffs or whole states.
+// For simplicity and robustness, we’ll do full buffer state snapshots (OK for small text).
+#[derive(Clone, Debug)]
+struct BufferSnapshot {
+    lines: Vec<String>,
+    cursor_row: usize,
+    cursor_col: usize,
+}
+
+impl BufferSnapshot {
+    fn from_buffer(buffer: &Buffer, cursor_row: usize, cursor_col: usize) -> Self {
+        BufferSnapshot {
+            lines: buffer.lines.clone(),
+            cursor_row,
+            cursor_col,
+        }
+    }
+}
+
+struct UndoManager {
+    undo_stack: Vec<BufferSnapshot>,
+    redo_stack: Vec<BufferSnapshot>,
+    in_transaction: bool,
+}
+
+impl UndoManager {
+    fn new() -> Self {
+        UndoManager {
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            in_transaction: false,
+        }
+    }
+
+    fn start_transaction(&mut self) {
+        self.in_transaction = true;
+    }
+
+    fn end_transaction(&mut self, buffer: &Buffer, cursor_row: usize, cursor_col: usize) {
+        if self.in_transaction {
+            self.in_transaction = false;
+            let snapshot = BufferSnapshot::from_buffer(buffer, cursor_row, cursor_col);
+            self.undo_stack.push(snapshot);
+            self.redo_stack.clear();
+        }
+    }
+
+    fn record(&mut self, buffer: &Buffer, cursor_row: usize, cursor_col: usize) {
+        let snapshot = BufferSnapshot::from_buffer(buffer, cursor_row, cursor_col);
+        self.undo_stack.push(snapshot);
+        self.redo_stack.clear();
+    }
+
+    fn undo(&mut self) -> Option<BufferSnapshot> {
+        self.redo_stack.push(BufferSnapshot {
+            lines: vec!["".to_string()],
+            cursor_row: 0,
+            cursor_col: 0,
+        }); // placeholder
+        let snapshot = self.undo_stack.pop()?;
+        let new_snapshot = self.redo_stack.pop().unwrap(); // pop placeholder
+        self.redo_stack.clear(); // now push snapshot properly
+        self.redo_stack.push(new_snapshot);
+        Some(snapshot)
+    }
+
+    fn redo(&mut self) -> Option<BufferSnapshot> {
+        let snapshot = self.redo_stack.pop()?;
+        self.undo_stack.push(BufferSnapshot {
+            lines: vec!["".to_string()],
+            cursor_row: 0,
+            cursor_col: 0,
+        });
+        self.undo_stack.pop(); // pop placeholder
+        Some(snapshot)
+    }
 }
 
 /// The Kill Ring (Yank Ring) - A FIFO queue for cut text
 struct KillRing {
     history: VecDeque<String>,
     max_size: usize,
+    last_action_was_kill: bool,
 }
 
 impl KillRing {
     fn new() -> Self {
         KillRing {
             history: VecDeque::new(),
-            max_size: 60, // GNU Emacs default
+            max_size: 60,
+            last_action_was_kill: false,
         }
     }
 
     fn kill(&mut self, text: String) {
-        if self.history.len() >= self.max_size {
-            self.history.pop_back();
+        if !self.last_action_was_kill {
+            // New kill — push new item
+            if self.history.len() >= self.max_size {
+                self.history.pop_back();
+            }
+            self.history.push_front(text);
+        } else {
+            // Append to most recent kill
+            if let Some(front) = self.history.front_mut() {
+                front.push_str(&text);
+            }
         }
-        self.history.push_front(text);
+        self.last_action_was_kill = true;
+    }
+
+    fn copy_line(&mut self, line: String) {
+        self.history.clear();
+        self.history.push_front(line);
+        self.last_action_was_kill = false;
     }
 
     fn yank(&self) -> Option<&String> {
         self.history.front()
+    }
+
+    fn reset_kill_state(&mut self) {
+        self.last_action_was_kill = false;
+    }
+}
+
+// Incremental search state
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchDirection {
+    Forward,
+    Backward,
+}
+
+struct SearchState {
+    query: String,
+    direction: SearchDirection,
+    current_row: usize,
+    current_col: usize,
+    match_row: Option<usize>,
+    match_col: Option<usize>,
+    active: bool,
+}
+
+impl SearchState {
+    fn new() -> Self {
+        SearchState {
+            query: String::new(),
+            direction: SearchDirection::Forward,
+            current_row: 0,
+            current_col: 0,
+            match_row: None,
+            match_col: None,
+            active: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.query.clear();
+        self.match_row = None;
+        self.match_col = None;
+        self.active = false;
     }
 }
 
@@ -105,7 +308,9 @@ struct Editor {
     cursor_row: usize,
     cursor_col: usize,
     kill_ring: KillRing,
+    undo_manager: UndoManager,
     quit: bool,
+    search: SearchState,
 }
 
 impl Editor {
@@ -115,7 +320,30 @@ impl Editor {
             cursor_row: 0,
             cursor_col = 0,
             kill_ring: KillRing::new(),
+            undo_manager: UndoManager::new(),
             quit: false,
+            search: SearchState::new(),
+        }
+    }
+
+    fn save_state(&mut self) {
+        self.undo_manager.record(&self.buffer, self.cursor_row, self.cursor_col);
+    }
+
+    fn undo(&mut self) {
+        if let Some(snapshot) = self.undo_manager.undo() {
+            self.buffer.lines = snapshot.lines;
+            self.cursor_row = snapshot.cursor_row;
+            self.cursor_col = snapshot.cursor_col;
+            // Don’t save undo as a new action — it’s part of undo chain
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(snapshot) = self.undo_manager.redo() {
+            self.buffer.lines = snapshot.lines;
+            self.cursor_row = snapshot.cursor_row;
+            self.cursor_col = snapshot.cursor_col;
         }
     }
 
@@ -163,29 +391,40 @@ impl Editor {
     // --- Core Editing Functions ---
 
     fn insert_char(&mut self, ch: char) {
+        if self.search.active {
+            self.cancel_search(); // insert cancels search
+        }
+        self.save_state();
         self.buffer.insert_char(ch, self.cursor_row, self.cursor_col);
         self.move_right();
     }
 
     fn delete_char(&mut self) {
+        if self.search.active {
+            self.cancel_search();
+        }
+        self.save_state();
         let row = self.cursor_row;
         let col = self.cursor_col;
 
         if col < self.buffer.get_line(row).len() {
-            // Delete char under cursor
             self.buffer.delete_char(row, col);
         } else if row + 1 < self.buffer.height() {
-            // Join lines (like C-d in Emacs)
             self.buffer.join_line_with_next(row);
         }
     }
 
     fn kill_word(&mut self) {
+        if self.search.active {
+            self.cancel_search();
+        }
+        self.save_state();
+        self.kill_ring.reset_kill_state();
         let line = self.buffer.get_line(self.cursor_row).to_string();
         let killed = line[self.cursor_col..].to_string();
 
         if !killed.is_empty() {
-            self.kill_ring.kill(killed);
+            self.kill_ring.kill(killed.clone());
         }
 
         let new_line = line[..self.cursor_col.min(line.len())].to_string();
@@ -193,17 +432,99 @@ impl Editor {
     }
 
     fn newline(&mut self) {
+        if self.search.active {
+            self.cancel_search();
+        }
+        self.save_state();
         self.buffer.newline(self.cursor_row, self.cursor_col);
         self.move_down();
         self.cursor_col = 0;
     }
 
     fn yank(&mut self) {
+        if self.search.active {
+            self.cancel_search();
+        }
         if let Some(text) = self.kill_ring.yank() {
+            self.save_state();
             for ch in text.chars() {
                 self.insert_char(ch);
             }
         }
+    }
+
+    // --- Search Logic ---
+
+    fn start_search(&mut self, direction: SearchDirection) {
+        if !self.search.active {
+            self.search.query.clear();
+            self.search.direction = direction;
+            self.search.current_row = self.cursor_row;
+            self.search.current_col = self.cursor_col;
+            self.search.active = true;
+            self.search.match_row = None;
+            self.search.match_col = None;
+        }
+    }
+
+    fn search_continue(&mut self) {
+        if !self.search.active {
+            return;
+        }
+
+        let res = match self.search.direction {
+            SearchDirection::Forward => {
+                self.buffer.search_forward(
+                    self.search.current_row,
+                    self.search.current_col + 1,
+                    &self.search.query,
+                )
+            }
+            SearchDirection::Backward => {
+                if self.search.query.is_empty() {
+                    // Incremental: search for empty string is a no-op, just move
+                    Some((self.search.current_row, self.search.current_col))
+                } else {
+                    self.buffer.search_backward(
+                        self.search.current_row,
+                        self.search.current_col,
+                        &self.search.query,
+                    )
+                }
+            }
+        };
+
+        if let Some((row, col)) = res {
+            self.search.current_row = row;
+            self.search.current_col = col;
+            self.search.match_row = Some(row);
+            self.search.match_col = Some(col);
+            self.cursor_row = row;
+            self.cursor_col = col;
+        } else {
+            // No match — clear match highlight
+            self.search.match_row = None;
+            self.search.match_col = None;
+        }
+    }
+
+    fn search_append_char(&mut self, ch: char) {
+        self.search.query.push(ch);
+        self.search_continue();
+    }
+
+    fn search_backspace(&mut self) {
+        self.search.query.pop();
+        if self.search.query.is_empty() {
+            self.search.match_row = None;
+            self.search.match_col = None;
+        }
+        self.search_continue();
+    }
+
+    fn cancel_search(&mut self) {
+        self.search.active = false;
+        self.search.query.clear();
     }
 
     // --- UI & Rendering ---
@@ -218,19 +539,28 @@ impl Editor {
 
         // Render each line
         for (i, line) in self.buffer.lines.iter().enumerate() {
-            if i == self.cursor_row {
-                // Render with cursor highlight
-                let max_col = line.len();
-                let (before, current, after) = if self.cursor_col < max_col {
-                    let before = &line[..self.cursor_col];
-                    let current = line[self.cursor_col..=self.cursor_col].to_string();
-                    let after = &line[self.cursor_col + 1..];
-                    (before, current, after)
+            let max_col = line.len();
+
+            // Is search active and current line has match?
+            let cursor_line = i == self.cursor_row;
+            let is_match_line = self.search.active && 
+                self.search.match_row == Some(i) &&
+                self.search.match_col == Some(0) && self.search.match_col.unwrap_or(0) < max_col;
+
+            if self.search.active && i == self.cursor_row {
+                // Draw with search highlight and cursor
+                let before = &line[..self.cursor_col];
+                let current = if self.cursor_col < max_col {
+                    line[self.cursor_col..=self.cursor_col].to_string()
                 } else {
-                    let before = line;
-                    let current = " ".to_string();
-                    ("", current, "")
+                    " ".to_string()
                 };
+                let after = if self.cursor_col < max_col {
+                    &line[self.cursor_col + 1..]
+                } else {
+                    ""
+                };
+
                 write!(stdout, "{}", before)?;
                 execute!(
                     stdout,
@@ -239,13 +569,39 @@ impl Editor {
                     SetForegroundColor(Color::White),
                 )?;
                 write!(stdout, "{}", after)?;
+            } else if is_match_line {
+                // Highlight match
+                let match_start = self.search.match_col.unwrap_or(0);
+                let match_len = self.search.query.len();
+                let match_end = match_start + match_len;
+
+                if match_end <= max_col {
+                    let before = &line[..match_start];
+                    let matched = &line[match_start..match_end];
+                    let after = &line[match_end..];
+
+                    write!(stdout, "{}", before)?;
+                    execute!(
+                        stdout,
+                        SetForegroundColor(Color::Yellow),
+                        Print(matched),
+                        SetForegroundColor(Color::White),
+                    )?;
+                    write!(stdout, "{}", after)?;
+                } else {
+                    writeln!(stdout, "{}", line)?;
+                }
             } else {
                 writeln!(stdout, "{}", line)?;
             }
         }
 
         // Status line
-        let pos = format!("Row: {}, Col: {}", self.cursor_row, self.cursor_col);
+        let mut pos = format!("Row: {}, Col: {}", self.cursor_row, self.cursor_col);
+        if self.search.active {
+            pos = format!("I-search `{}`", self.search.query);
+        }
+
         let dashes_before = 10;
         let dashes_after = 20 - pos.len() - dashes_before;
         let status_line = format!(
@@ -265,20 +621,22 @@ impl Editor {
         )?;
 
         // Instructions
-        writeln!(
-            stdout,
-            "\n(C-x C-c to quit) | (C-f/b/n/p) | (C-d) | (M-w Kill Word) | (C-y Yank)"
-        )?;
+        let mut instr = "\n(C-x C-c quit) | (C-f/b/n/p) | (C-d) | (M-w copy line) | (C-w kill) | (C-y yank)".to_string();
+        if self.search.active {
+            instr = format!("{} | (C-g cancel) | (C-s/r repeat) | (enter search)", instr);
+        } else {
+            instr.push_str(" | (C-s/r search)");
+        }
+
+        writeln!(stdout, "{}", instr)?;
 
         execute!(stdout, Show)?;
         stdout.flush()
     }
 
     fn run(&mut self) -> io::Result<()> {
-        // Enter raw mode
         enable_raw_mode()?;
 
-        // Setup signal handling (optional but good for restore)
         let _restore = OnDrop::new(|| {
             let _ = disable_raw_mode();
         });
@@ -295,6 +653,10 @@ impl Editor {
         println!("  Meta-w (Alt-w): Copy line");
         println!("  Ctrl-w: Cut (Kill) to end of line");
         println!("  Ctrl-y: Yank (Paste)");
+        println!("  Alt-/ or Ctrl-/: Undo");
+        println!("  Ctrl-r: Redo");
+        println!("  C-s / C-r: Incremental Search");
+        println!("  C-g: Cancel search / undo");
         println!("  Ctrl-x Ctrl-c: Quit");
 
         self.render()?;
@@ -302,6 +664,34 @@ impl Editor {
         loop {
             match event::read()? {
                 Event::Key(key_event) => {
+                    // Handle search mode first
+                    if self.search.active {
+                        match key_event.code {
+                            KeyCode::Char('\n') | KeyCode::Enter => {
+                                self.search.active = false;
+                            }
+                            KeyCode::Char(c) if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                                self.search_append_char(c);
+                            }
+                            KeyCode::Backspace => {
+                                self.search_backspace();
+                            }
+                            KeyCode::Char('c') | KeyCode::Char('g') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                                self.cancel_search();
+                            }
+                            KeyCode::Char('s') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                                self.search_continue();
+                            }
+                            KeyCode::Char('r') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                                self.search.direction = SearchDirection::Backward;
+                                self.search_continue();
+                            }
+                            _ => {}
+                        }
+                        self.render()?;
+                        continue;
+                    }
+
                     match key_event.code {
                         KeyCode::Char(c) => {
                             if key_event.modifiers.contains(KeyModifiers::CONTROL) {
@@ -324,37 +714,86 @@ impl Editor {
                                             }
                                         }
                                     }
+                                    's' => {
+                                        self.start_search(SearchDirection::Forward);
+                                    }
+                                    'r' => {
+                                        self.start_search(SearchDirection::Backward);
+                                    }
                                     'w' => self.kill_word(),
+                                    'y' => self.yank(),
+                                    '/' | 'g' => self.undo(), // Alt-/ or C-g cancels search and can be used for undo too
                                     _ => {}
                                 }
                             } else if key_event.modifiers.contains(KeyModifiers::ALT) {
                                 if c == 'w' {
                                     let line = self.buffer.get_line(self.cursor_row).to_string();
-                                    self.kill_ring.kill(line);
+                                    self.save_state();
+                                    self.kill_ring.copy_line(line);
                                 } else if c == 'y' {
                                     self.yank();
+                                } else if c == '/' {
+                                    self.undo();
                                 }
+                            } else if key_event.modifiers.contains(KeyModifiers::SHIFT) && c == '-' {
+                                // C-_ is alternative undo
+                                self.undo();
                             } else {
                                 self.insert_char(c);
                             }
                         }
-                        KeyCode::Left => self.move_left(),
-                        KeyCode::Right => self.move_right(),
-                        KeyCode::Up => self.move_up(),
-                        KeyCode::Down => self.move_down(),
-                        KeyCode::Backspace => {
+                        KeyCode::Left => {
+                            if self.search.active {
+                                self.cancel_search();
+                            }
                             self.move_left();
-                            self.delete_char();
+                        }
+                        KeyCode::Right => {
+                            if self.search.active {
+                                self.cancel_search();
+                            }
+                            self.move_right();
+                        }
+                        KeyCode::Up => {
+                            if self.search.active {
+                                self.cancel_search();
+                            }
+                            self.move_up();
+                        }
+                        KeyCode::Down => {
+                            if self.search.active {
+                                self.cancel_search();
+                            }
+                            self.move_down();
+                        }
+                        KeyCode::Backspace => {
+                            if self.search.active {
+                                self.search_backspace();
+                            } else {
+                                self.move_left();
+                                self.delete_char();
+                            }
                         }
                         KeyCode::Enter => {
-                            self.newline();
+                            if self.search.active {
+                                // Enter finalizes search
+                                self.search.active = false;
+                            } else {
+                                self.newline();
+                            }
                         }
                         _ => {}
                     }
-                    self.render()?;
+
+                    if !self.search.active {
+                        self.render()?;
+                    } else {
+                        // Still in search mode — render only once
+                        self.render()?;
+                    }
                 }
                 Event::Resize(_, _) => {
-                    // Ignore resize for now
+                    // Ignore resize
                 }
                 _ => {}
             }
