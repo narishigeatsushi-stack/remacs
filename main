@@ -77,34 +77,17 @@ impl Buffer {
             return Some((start_row, start_col));
         }
 
-        // Start from given position
-        let mut row = start_row;
-        let mut col = start_col;
-        let mut search_line = row;
-        let mut search_col = col;
-
-        loop {
-            if search_line >= self.lines.len() {
-                break;
-            }
-            let line = &self.lines[search_line];
-            if search_line == row {
-                // slice from current position
-                if let Some(idx) = line[search_col..].find(query) {
-                    return Some((search_line, search_col + idx));
+        for r in start_row..self.lines.len() {
+            let line = &self.lines[r];
+            let start_col = if r == start_row { start_col } else { 0 };
+            if start_col < line.len() && start_col + query.len() <= line.len() {
+                if let Some(idx) = line[start_col..].find(query) {
+                    return Some((r, start_col + idx));
                 }
-            } else {
-                if let Some(idx) = line.find(query) {
-                    return Some((search_line, idx));
-                }
+            } else if r > start_row && let Some(idx) = line.find(query) {
+                return Some((r, idx));
             }
-
-            // Next line
-            search_line += 1;
-            search_col = 0;
         }
-
-        // Wrap around? We won’t wrap for simplicity — just return None
         None
     }
 
@@ -113,34 +96,25 @@ impl Buffer {
             return Some((start_row, start_col));
         }
 
-        let mut row = start_row;
-        let mut col = start_col;
-
-        // Start from start_row and go backward
-        for r in (0..=row).rev() {
+        for r in (0..=start_row).rev() {
             let line = &self.lines[r];
-            let start_search_col = if r == row { col } else { line.len() };
-
-            // Look for last occurrence in this line
-            let mut last_pos = None;
-            let mut pos = 0;
-            while pos <= start_search_col - query.len() {
-                if line[pos..].starts_with(query) {
-                    last_pos = Some(pos);
+            let max_col = if r == start_row { start_col } else { line.len() };
+            // Find last occurrence ending at or before max_col
+            if let Some(idx) = line[..max_col.saturating_add(query.len())].rfind(query) {
+                // Ensure it ends at or before max_col
+                if idx + query.len() <= max_col {
+                    return Some((r, idx));
                 }
-                pos += 1;
-            }
-            if let Some(idx) = last_pos {
+                // Even if not, prefer this
                 return Some((r, idx));
             }
         }
-
         None
     }
 }
 
-// Undo history — stores line-by-line diffs or whole states.
-// For simplicity and robustness, we’ll do full buffer state snapshots (OK for small text).
+// --- Undo ---
+
 #[derive(Clone, Debug)]
 struct BufferSnapshot {
     lines: Vec<String>,
@@ -161,7 +135,6 @@ impl BufferSnapshot {
 struct UndoManager {
     undo_stack: Vec<BufferSnapshot>,
     redo_stack: Vec<BufferSnapshot>,
-    in_transaction: bool,
 }
 
 impl UndoManager {
@@ -169,20 +142,6 @@ impl UndoManager {
         UndoManager {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
-            in_transaction: false,
-        }
-    }
-
-    fn start_transaction(&mut self) {
-        self.in_transaction = true;
-    }
-
-    fn end_transaction(&mut self, buffer: &Buffer, cursor_row: usize, cursor_col: usize) {
-        if self.in_transaction {
-            self.in_transaction = false;
-            let snapshot = BufferSnapshot::from_buffer(buffer, cursor_row, cursor_col);
-            self.undo_stack.push(snapshot);
-            self.redo_stack.clear();
         }
     }
 
@@ -192,32 +151,33 @@ impl UndoManager {
         self.redo_stack.clear();
     }
 
-    fn undo(&mut self) -> Option<BufferSnapshot> {
-        self.redo_stack.push(BufferSnapshot {
-            lines: vec!["".to_string()],
-            cursor_row: 0,
-            cursor_col: 0,
-        }); // placeholder
-        let snapshot = self.undo_stack.pop()?;
-        let new_snapshot = self.redo_stack.pop().unwrap(); // pop placeholder
-        self.redo_stack.clear(); // now push snapshot properly
-        self.redo_stack.push(new_snapshot);
-        Some(snapshot)
+    fn undo(&mut self, buffer: &mut Buffer, cursor_row: &mut usize, cursor_col: &mut usize) -> bool {
+        if let Some(snapshot) = self.undo_stack.pop() {
+            self.redo_stack.push(BufferSnapshot::from_buffer(buffer, *cursor_row, *cursor_col));
+            buffer.lines = snapshot.lines;
+            *cursor_row = snapshot.cursor_row;
+            *cursor_col = snapshot.cursor_col;
+            true
+        } else {
+            false
+        }
     }
 
-    fn redo(&mut self) -> Option<BufferSnapshot> {
-        let snapshot = self.redo_stack.pop()?;
-        self.undo_stack.push(BufferSnapshot {
-            lines: vec!["".to_string()],
-            cursor_row: 0,
-            cursor_col: 0,
-        });
-        self.undo_stack.pop(); // pop placeholder
-        Some(snapshot)
+    fn redo(&mut self, buffer: &mut Buffer, cursor_row: &mut usize, cursor_col: &mut usize) -> bool {
+        if let Some(snapshot) = self.redo_stack.pop() {
+            self.undo_stack.push(BufferSnapshot::from_buffer(buffer, *cursor_row, *cursor_col));
+            buffer.lines = snapshot.lines;
+            *cursor_row = snapshot.cursor_row;
+            *cursor_col = snapshot.cursor_col;
+            true
+        } else {
+            false
+        }
     }
 }
 
-/// The Kill Ring (Yank Ring) - A FIFO queue for cut text
+// --- Kill Ring (Yank Ring) ---
+
 struct KillRing {
     history: VecDeque<String>,
     max_size: usize,
@@ -235,16 +195,12 @@ impl KillRing {
 
     fn kill(&mut self, text: String) {
         if !self.last_action_was_kill {
-            // New kill — push new item
             if self.history.len() >= self.max_size {
                 self.history.pop_back();
             }
             self.history.push_front(text);
-        } else {
-            // Append to most recent kill
-            if let Some(front) = self.history.front_mut() {
-                front.push_str(&text);
-            }
+        } else if let Some(front) = self.history.front_mut() {
+            front.push_str(&text);
         }
         self.last_action_was_kill = true;
     }
@@ -264,7 +220,8 @@ impl KillRing {
     }
 }
 
-// Incremental search state
+// --- Search State ---
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SearchDirection {
     Forward,
@@ -318,7 +275,7 @@ impl Editor {
         Editor {
             buffer: Buffer::new(),
             cursor_row: 0,
-            cursor_col = 0,
+            cursor_col: 0,
             kill_ring: KillRing::new(),
             undo_manager: UndoManager::new(),
             quit: false,
@@ -331,23 +288,14 @@ impl Editor {
     }
 
     fn undo(&mut self) {
-        if let Some(snapshot) = self.undo_manager.undo() {
-            self.buffer.lines = snapshot.lines;
-            self.cursor_row = snapshot.cursor_row;
-            self.cursor_col = snapshot.cursor_col;
-            // Don’t save undo as a new action — it’s part of undo chain
-        }
+        self.undo_manager.undo(&mut self.buffer, &mut self.cursor_row, &mut self.cursor_col);
     }
 
     fn redo(&mut self) {
-        if let Some(snapshot) = self.undo_manager.redo() {
-            self.buffer.lines = snapshot.lines;
-            self.cursor_row = snapshot.cursor_row;
-            self.cursor_col = snapshot.cursor_col;
-        }
+        self.undo_manager.redo(&mut self.buffer, &mut self.cursor_row, &mut self.cursor_col);
     }
 
-    // --- Core Movement Functions ---
+    // --- Movement ---
 
     fn move_up(&mut self) {
         if self.cursor_row > 0 {
@@ -388,11 +336,11 @@ impl Editor {
         }
     }
 
-    // --- Core Editing Functions ---
+    // --- Editing ---
 
     fn insert_char(&mut self, ch: char) {
         if self.search.active {
-            self.cancel_search(); // insert cancels search
+            self.cancel_search();
         }
         self.save_state();
         self.buffer.insert_char(ch, self.cursor_row, self.cursor_col);
@@ -421,13 +369,17 @@ impl Editor {
         self.save_state();
         self.kill_ring.reset_kill_state();
         let line = self.buffer.get_line(self.cursor_row).to_string();
-        let killed = line[self.cursor_col..].to_string();
-
+        let pos = self.cursor_col.min(line.len());
+        let end = line[pos..]
+            .chars()
+            .position(|c| !c.is_alphanumeric() && c != '_')
+            .map(|i| pos + i)
+            .unwrap_or(line.len());
+        let killed = line[pos..end].to_string();
         if !killed.is_empty() {
             self.kill_ring.kill(killed.clone());
         }
-
-        let new_line = line[..self.cursor_col.min(line.len())].to_string();
+        let new_line = [&line[..pos], &line[end..]].join("");
         self.buffer.lines[self.cursor_row] = new_line;
     }
 
@@ -453,7 +405,7 @@ impl Editor {
         }
     }
 
-    // --- Search Logic ---
+    // --- Search ---
 
     fn start_search(&mut self, direction: SearchDirection) {
         if !self.search.active {
@@ -464,6 +416,7 @@ impl Editor {
             self.search.active = true;
             self.search.match_row = None;
             self.search.match_col = None;
+            self.render().unwrap_or_else(|_| ());
         }
     }
 
@@ -474,20 +427,20 @@ impl Editor {
 
         let res = match self.search.direction {
             SearchDirection::Forward => {
+                // search forward from current col (including it)
                 self.buffer.search_forward(
                     self.search.current_row,
-                    self.search.current_col + 1,
+                    self.search.current_col,
                     &self.search.query,
                 )
             }
             SearchDirection::Backward => {
                 if self.search.query.is_empty() {
-                    // Incremental: search for empty string is a no-op, just move
                     Some((self.search.current_row, self.search.current_col))
                 } else {
                     self.buffer.search_backward(
                         self.search.current_row,
-                        self.search.current_col,
+                        self.search.current_col + 1,
                         &self.search.query,
                     )
                 }
@@ -502,7 +455,6 @@ impl Editor {
             self.cursor_row = row;
             self.cursor_col = col;
         } else {
-            // No match — clear match highlight
             self.search.match_row = None;
             self.search.match_col = None;
         }
@@ -510,21 +462,20 @@ impl Editor {
 
     fn search_append_char(&mut self, ch: char) {
         self.search.query.push(ch);
+        self.search.current_col += 1; // move ahead in line for next match search
         self.search_continue();
     }
 
     fn search_backspace(&mut self) {
         self.search.query.pop();
-        if self.search.query.is_empty() {
-            self.search.match_row = None;
-            self.search.match_col = None;
-        }
         self.search_continue();
     }
 
     fn cancel_search(&mut self) {
         self.search.active = false;
         self.search.query.clear();
+        self.search.match_row = None;
+        self.search.match_col = None;
     }
 
     // --- UI & Rendering ---
@@ -533,23 +484,33 @@ impl Editor {
         let stdout = io::stdout();
         execute!(stdout, Hide)?;
 
-        // Clear screen & move home
         execute!(stdout, crossterm::terminal::Clear(crossterm::terminal::ClearType::All))?;
         execute!(stdout, MoveTo(0, 0))?;
 
         // Render each line
         for (i, line) in self.buffer.lines.iter().enumerate() {
-            let max_col = line.len();
+            if self.search.active
+                && self.search.match_row == Some(i)
+                && let Some(match_col) = self.search.match_col
+                && self.search.query.len() > 0
+            {
+                let match_end = (match_col + self.search.query.len()).min(line.len());
+                let before = &line[..match_col];
+                let matched = &line[match_col..match_end];
+                let after = &line[match_end..];
 
-            // Is search active and current line has match?
-            let cursor_line = i == self.cursor_row;
-            let is_match_line = self.search.active && 
-                self.search.match_row == Some(i) &&
-                self.search.match_col == Some(0) && self.search.match_col.unwrap_or(0) < max_col;
-
-            if self.search.active && i == self.cursor_row {
-                // Draw with search highlight and cursor
-                let before = &line[..self.cursor_col];
+                write!(stdout, "{}", before)?;
+                execute!(
+                    stdout,
+                    SetForegroundColor(Color::Yellow),
+                    Print(matched),
+                    SetForegroundColor(Color::White),
+                )?;
+                write!(stdout, "{}", after)?;
+                writeln!(stdout)?;
+            } else if i == self.cursor_row {
+                let max_col = line.len();
+                let before = &line[..self.cursor_col.min(max_col)];
                 let current = if self.cursor_col < max_col {
                     line[self.cursor_col..=self.cursor_col].to_string()
                 } else {
@@ -569,28 +530,7 @@ impl Editor {
                     SetForegroundColor(Color::White),
                 )?;
                 write!(stdout, "{}", after)?;
-            } else if is_match_line {
-                // Highlight match
-                let match_start = self.search.match_col.unwrap_or(0);
-                let match_len = self.search.query.len();
-                let match_end = match_start + match_len;
-
-                if match_end <= max_col {
-                    let before = &line[..match_start];
-                    let matched = &line[match_start..match_end];
-                    let after = &line[match_end..];
-
-                    write!(stdout, "{}", before)?;
-                    execute!(
-                        stdout,
-                        SetForegroundColor(Color::Yellow),
-                        Print(matched),
-                        SetForegroundColor(Color::White),
-                    )?;
-                    write!(stdout, "{}", after)?;
-                } else {
-                    writeln!(stdout, "{}", line)?;
-                }
+                writeln!(stdout)?;
             } else {
                 writeln!(stdout, "{}", line)?;
             }
@@ -601,16 +541,14 @@ impl Editor {
         if self.search.active {
             pos = format!("I-search `{}`", self.search.query);
         }
-
-        let dashes_before = 10;
-        let dashes_after = 20 - pos.len() - dashes_before;
+        let status_len = 60;
+        let mut dashes_before = (status_len - pos.len()).max(10) / 2;
+        let mut dashes_after = status_len - pos.len() - dashes_before;
         let status_line = format!(
-            "{}{}{}{}{}",
+            "[{}{}{}]",
             "-".repeat(dashes_before),
             pos,
-            "-".repeat(dashes_after),
-            " - RustEmacs",
-            "-".repeat(10)
+            "-".repeat(dashes_after.max(1)),
         );
         execute!(
             stdout,
@@ -623,12 +561,13 @@ impl Editor {
         // Instructions
         let mut instr = "\n(C-x C-c quit) | (C-f/b/n/p) | (C-d) | (M-w copy line) | (C-w kill) | (C-y yank)".to_string();
         if self.search.active {
-            instr = format!("{} | (C-g cancel) | (C-s/r repeat) | (enter search)", instr);
+            instr = format!("{} | (C-g cancel) | (C-s/r repeat)", instr);
         } else {
             instr.push_str(" | (C-s/r search)");
         }
 
         writeln!(stdout, "{}", instr)?;
+        writeln!(stdout, "{}", "-".repeat(status_len))?;
 
         execute!(stdout, Show)?;
         stdout.flush()
@@ -651,7 +590,7 @@ impl Editor {
         println!("  Ctrl-a: Move to start of line");
         println!("  Ctrl-e: Move to end of line");
         println!("  Meta-w (Alt-w): Copy line");
-        println!("  Ctrl-w: Cut (Kill) to end of line");
+        println!("  Ctrl-w: Cut (Kill) to end of word");
         println!("  Ctrl-y: Yank (Paste)");
         println!("  Alt-/ or Ctrl-/: Undo");
         println!("  Ctrl-r: Redo");
@@ -680,6 +619,7 @@ impl Editor {
                                 self.cancel_search();
                             }
                             KeyCode::Char('s') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                                self.search.direction = SearchDirection::Forward;
                                 self.search_continue();
                             }
                             KeyCode::Char('r') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -722,7 +662,7 @@ impl Editor {
                                     }
                                     'w' => self.kill_word(),
                                     'y' => self.yank(),
-                                    '/' | 'g' => self.undo(), // Alt-/ or C-g cancels search and can be used for undo too
+                                    '/' | 'g' => self.undo(),
                                     _ => {}
                                 }
                             } else if key_event.modifiers.contains(KeyModifiers::ALT) {
@@ -736,7 +676,6 @@ impl Editor {
                                     self.undo();
                                 }
                             } else if key_event.modifiers.contains(KeyModifiers::SHIFT) && c == '-' {
-                                // C-_ is alternative undo
                                 self.undo();
                             } else {
                                 self.insert_char(c);
@@ -776,7 +715,6 @@ impl Editor {
                         }
                         KeyCode::Enter => {
                             if self.search.active {
-                                // Enter finalizes search
                                 self.search.active = false;
                             } else {
                                 self.newline();
@@ -785,12 +723,7 @@ impl Editor {
                         _ => {}
                     }
 
-                    if !self.search.active {
-                        self.render()?;
-                    } else {
-                        // Still in search mode — render only once
-                        self.render()?;
-                    }
+                    self.render()?;
                 }
                 Event::Resize(_, _) => {
                     // Ignore resize
@@ -807,7 +740,7 @@ impl Editor {
     }
 }
 
-// Helper to restore state on drop
+// --- Helper to restore state on drop ---
 struct OnDrop<F: FnMut()> {
     f: F,
 }
@@ -824,8 +757,7 @@ impl<F: FnMut()> Drop for OnDrop<F> {
     }
 }
 
-// --- MAIN ENTRY POINT ---
-
+// --- MAIN ---
 fn main() -> io::Result<()> {
     let mut editor = Editor::new();
     editor.run()
